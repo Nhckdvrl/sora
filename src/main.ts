@@ -5,6 +5,8 @@ import type { ParameterValues } from '@standrig/core/types';
 import { reactions, reactionAt, faceReactionPose, type ReactionKind } from './sora-reactions';
 import {sampleGesture,advanceGesture,type GesturePose} from './sora-gestures';
 import {initConversation,type ConversationController,type AIReply} from './conversation';
+import {PerformanceDirector,performanceDemos} from './performance';
+import {initScreenWake} from './screen-wake';
 import './sora.css';
 
 const $=<T extends HTMLElement>(s:string)=>document.querySelector<T>(s)!;
@@ -12,6 +14,8 @@ const canvas=$<HTMLCanvasElement>('#sora-canvas'),stage=$('#stage'),scene=$('.st
 const names=['自然','开心','害羞','得意','担心','坏笑','含泪','俏皮','撒娇','认真','单眼眨眼','轻闭双眼'];
 const status=$('#status'),exportStatus=$('#export-status'),feedback=$('#touch-feedback'),hint=$('#interaction-hint');
 let conversation:ConversationController|undefined;
+const director=new PerformanceDirector();
+let performanceLabel='';
 let expression=0,paused=false,portrait=true,background=0,ready=false,runtime:RigRuntime,modelSource='';
 let pointer={x:0,y:0},look={x:0,y:0},eyeTarget={x:0,y:0},gaze={x:0,y:0};
 let last=performance.now(),lastRender=0,elapsed=0,nextBlink=2.8,blinkStart=-1;
@@ -33,8 +37,14 @@ const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
 if(reduced){$<HTMLInputElement>('#idle').checked=false;$<HTMLInputElement>('#follow').checked=false;document.body.classList.add('reduced');}
 const buttons=names.map((name,i)=>{const b=document.createElement('button');b.textContent=name;b.setAttribute('aria-pressed',String(i===0));b.onclick=()=>selectExpression(i);$('#expressions').append(b);return b;});
 const actionButtons=reactions.map(def=>{const b=document.createElement('button');b.textContent=def.label;b.title=def.hint;b.dataset.reactionId=def.id;b.setAttribute('aria-pressed','false');b.onclick=()=>touch(def.id,{x:def.anchor[0],y:def.anchor[1]});$('#interaction-actions').append(b);return b;});
+initScreenWake($<HTMLButtonElement>('#wake-screen'));
+for(const button of document.querySelectorAll<HTMLButtonElement>('[data-dialogue-demo]'))button.onclick=()=>{
+ const demo=performanceDemos[button.dataset.dialogueDemo??''];if(!ready||!demo)return;conversation?.stop();reaction=null;director.respond(demo.reply);paused=false;
+ $('#chat-state').textContent='动作预览 · 不发送消息';feedback.textContent='动作预览 · '+demo.label;feedback.classList.add('visible');canvas.dataset.demo=button.dataset.dialogueDemo!;
+};
 function selectExpression(i:number,transient=false){
- if(!transient){reaction=null;feedback.classList.remove('visible');feedback.textContent='轻轻碰一碰，她会回应你。';delete canvas.dataset.reaction;actionButtons.forEach(b=>b.setAttribute('aria-pressed','false'));paused=false;}
+ if(!transient){director.manual(i);reaction=null;feedback.classList.remove('visible');feedback.textContent='轻轻碰一碰，她会回应你。';delete canvas.dataset.reaction;actionButtons.forEach(b=>b.setAttribute('aria-pressed','false'));paused=false;}
+ else if(reaction)director.cover(i);
  expression=i;buttons.forEach((b,j)=>b.setAttribute('aria-pressed',String(i===j)));$('#expression-name').textContent=names[i];
 }
 function touch(kind:ReactionKind,p:{x:number;y:number}){
@@ -99,19 +109,26 @@ document.addEventListener('keydown',e=>{if((e.target instanceof HTMLElement&&e.t
 function tick(now:number){
  requestAnimationFrame(tick);if(!ready||document.hidden||now-lastRender<1000/30)return;const dt=Math.min(.1,(now-last)/1000);last=now;lastRender=now;if(paused)return;elapsed+=dt;
  const t=elapsed,idle=enabled('idle'),follow=enabled('follow'),eyeFollow=enabled('gaze'),headEase=1-Math.exp(-dt*6.5),eyeEase=1-Math.exp(-dt*22);
- look.x+=((follow?pointer.x:0)-look.x)*headEase;look.y+=((follow?pointer.y:0)-look.y)*headEase;gaze.x+=((eyeFollow?eyeTarget.x:0)-gaze.x)*eyeEase;gaze.y+=((eyeFollow?eyeTarget.y:0)-gaze.y)*eyeEase;
  if(reaction&&t>=reaction.until){const base=reaction.base;reaction=null;selectExpression(base,true);feedback.classList.remove('visible');delete canvas.dataset.reaction;actionButtons.forEach(b=>b.setAttribute('aria-pressed','false'));}
+ const auto=director.update(dt,{blocked:!!reaction,reduced,speechProgress:conversation?.speechProgress()}),attention=auto.attention;
+ look.x+=((follow?pointer.x*(1-attention*.75):0)-look.x)*headEase;look.y+=((follow?pointer.y*(1-attention*.75):0)-look.y)*headEase;
+ gaze.x+=((eyeFollow?eyeTarget.x*(1-attention)+auto.gaze.x*attention:0)-gaze.x)*eyeEase;gaze.y+=((eyeFollow?eyeTarget.y*(1-attention)+auto.gaze.y*attention:0)-gaze.y)*eyeEase;
  const def=reaction?reactions.find(r=>r.id===reaction!.kind)!:null,age=reaction?t-reaction.start:0,response=reaction?(1-Math.exp(-age*18))*Math.exp(-age*1.1):0,side=reaction?.side??1;
  const touchRoll=(def?.tilt??0)*response*side,touchNod=(def?.nod??0)*response;let eye=1;
  if(enabled('blink')){if(t>=nextBlink){blinkStart=t;nextBlink=t+3.4+(Math.sin(t*2.7)+1)*1.2;}const bt=t-blinkStart;if(bt>=0&&bt<.16)eye=Math.abs(bt-.08)/.08;}
  if(reaction?.kind==='nose'&&age<.16)eye=Math.abs(age-.08)/.08;if(!dragging)hairImpulse*=Math.exp(-dt*4);
  const breeze=breezeUntil>t?Math.sin((1-(breezeUntil-t)/3.2)*Math.PI)*.9:0,physics=enabled('hair-motion');if(runtime.rig.physics.enabled!==physics){runtime.rig.physics.enabled=physics;runtime.resetPhysics();}const flutter=Math.sin(age*12)*Math.exp(-age*2.2);
- values={ParamExpression:expression,ParamAngleX:clamp(value('yaw')+look.x*10+(idle?Math.sin(t*.49)*1:0),10),ParamAngleY:clamp(value('pitch')+look.y*7.5+touchNod+(idle?Math.sin(t*.68)*.65:0),8),ParamAngleZ:clamp(value('roll')-look.x*2.8+touchRoll+(idle?Math.sin(t*.42)*.8:0)+(greetUntil>t?Math.sin(t*4)*.65:0),6),ParamBodyAngleX:clamp(look.x*1.6+(idle?Math.sin(t*.49-.65)*.65:0),6),ParamBodyAngleY:clamp(look.y*.45+(idle?Math.sin(t*.66)*.3:0)+touchNod*.2,4),ParamBodyAngleZ:clamp(-look.x*.65+(idle?Math.sin(t*.42-.6)*.4:0)+(def?.body??0)*response*side,3),ParamBreath:idle?(1-Math.cos(t*1.34))*.5:0,ParamEyeBallX:clamp(gaze.x+(idle ? .025*Math.sin(t*2.1) : 0)),ParamEyeBallY:clamp(gaze.y),ParamHairFront:0,ParamHairSide:0,ParamHairBack:0,ParamHairImpulse:hairImpulse,ParamBreeze:breeze,ParamBowFlutter:reaction?.kind==='bow'?flutter:0,ParamSkirtFlutter:reaction?.kind==='skirt'?flutter*.8:breeze*.4,ParamEyeLOpen:winkUntil>t?0:eye,ParamEyeROpen:eye,ParamMouthOpen:1};
+ values={ParamExpression:reaction?expression:auto.expression,ParamAngleX:clamp(value('yaw')+auto.pose.yaw+look.x*10+(idle?Math.sin(t*.49)*1:0),10),ParamAngleY:clamp(value('pitch')+auto.pose.pitch+look.y*7.5+touchNod+(idle?Math.sin(t*.68)*.65:0),8),ParamAngleZ:clamp(value('roll')+auto.pose.roll-look.x*2.8+touchRoll+(idle?Math.sin(t*.42)*.8:0)+(greetUntil>t?Math.sin(t*4)*.65:0),6),ParamBodyAngleX:clamp(auto.pose.bodyYaw+look.x*1.6+(idle?Math.sin(t*.49-.65)*.65:0),6),ParamBodyAngleY:clamp(auto.pose.bodyPitch+look.y*.45+(idle?Math.sin(t*.66)*.3:0)+touchNod*.2,4),ParamBodyAngleZ:clamp(auto.pose.bodyRoll-look.x*.65+(idle?Math.sin(t*.42-.6)*.4:0)+(def?.body??0)*response*side,3),ParamBreath:idle?(1-Math.cos(t*1.34))*.5:0,ParamEyeBallX:clamp(gaze.x+(idle ? .025*Math.sin(t*2.1) : 0)),ParamEyeBallY:clamp(gaze.y),ParamHairFront:0,ParamHairSide:0,ParamHairBack:0,ParamHairImpulse:hairImpulse,ParamBreeze:breeze,ParamBowFlutter:reaction?.kind==='bow'?flutter:0,ParamSkirtFlutter:reaction?.kind==='skirt'?flutter*.8:breeze*.4,ParamEyeLOpen:(winkUntil>t?0:eye)*auto.eyeOpen,ParamEyeROpen:eye*auto.eyeOpen,ParamMouthOpen:reaction?1:auto.mouthOpen};
  const targetGesture=sampleGesture(reaction?.kind??null,age,def?.duration??0,side);
- if(idle&&!reaction){targetGesture.ParamArmRShoulder=.6*Math.sin(t*.85+.4);targetGesture.ParamArmRElbow=.45*Math.sin(t*.85-.3);targetGesture.ParamArmLWrist=.35*Math.sin(t*.7);}
+ if(!reaction)for(const [id,value] of Object.entries(auto.gesture))targetGesture[id]=value;
+ if(idle&&!reaction){targetGesture.ParamArmRShoulder=(targetGesture.ParamArmRShoulder??0)+.6*Math.sin(t*.85+.4);targetGesture.ParamArmRElbow=(targetGesture.ParamArmRElbow??0)+.45*Math.sin(t*.85-.3);targetGesture.ParamArmLWrist=(targetGesture.ParamArmLWrist??0)+.35*Math.sin(t*.7);}
  advanceGesture(gesturePose,gestureVelocity,targetGesture,dt);
  Object.assign(values,gesturePose,faceReactionPose(reaction?.kind??null,age,def?.duration??0));
  const speechMouth=conversation?.mouthOpen();if(speechMouth!==undefined&&speechMouth!==null)values.ParamMouthOpen=speechMouth;
+ const phaseNames={idle:'自在待着',listening:'认真听你说',thinking:'想一想',waiting:'等你片刻',replying:'回应你',speaking:'正在说话',interrupted:'你说，我在听',error:'稍等一下'};
+ const label=phaseNames[auto.phase],key=label+':'+values.ParamExpression+':'+(reaction?.kind??'');
+ if(key!==performanceLabel){performanceLabel=key;$('#performance-state').textContent=label;if(!reaction){buttons.forEach((b,i)=>b.setAttribute('aria-pressed',String(i===values.ParamExpression)));$('#expression-name').textContent=names[values.ParamExpression??0]+' · '+label;}}
+ canvas.dataset.phase=auto.phase;canvas.dataset.performance=JSON.stringify({phase:auto.phase,progress:auto.progress,attention:auto.attention});
  const started=performance.now();runtime.render(canvas,values,camera());canvas.dataset.ready='true';canvas.dataset.expression=String(expression);canvas.dataset.time=t.toFixed(3);canvas.dataset.pose=JSON.stringify(values);canvas.dataset.frameMs=(performance.now()-started).toFixed(1);
 }
-try{const model=await loadSoraModel();modelSource=model.source;runtime=new RigRuntime(model.rig,{cacheEvaluation:true});await runtime.loadAssets();ready=true;status.textContent='原作模型 · 目光与发丝';conversation=initConversation({thinking(){selectExpression(9);feedback.textContent='让我想一想……';},reply(reply:AIReply){const emotions:Record<string,number>={neutral:0,happy:1,shy:2,confident:3,worried:4,playful:7,serious:9};selectExpression(emotions[reply.emotion]??0);if(['wave','hand','bow'].includes(reply.gesture)){const action=reactions.find(r=>r.id===reply.gesture)!;touch(action.id,{x:action.anchor[0],y:action.anchor[1]});}feedback.textContent=reply.reply;feedback.classList.add('visible');},error(message:string){selectExpression(0);feedback.textContent=message;}});requestAnimationFrame(tick);}catch(e){$('#error').textContent='模型载入失败：'+String(e)+'。请刷新页面重试。';status.textContent='模型未载入';}
+try{const model=await loadSoraModel();modelSource=model.source;runtime=new RigRuntime(model.rig,{cacheEvaluation:true});await runtime.loadAssets();ready=true;status.textContent='原作模型 · 目光与发丝';conversation=initConversation({thinking(){director.setPhase('thinking');paused=false;feedback.textContent='让我想一想……';},reply(reply:AIReply){director.respond(reply);paused=false;feedback.textContent=reply.reply;feedback.classList.add('visible');},error(message:string){director.setPhase('error');feedback.textContent=message;},phase(phase){if(phase==='finished')director.finishSpeech();else director.setPhase(phase);paused=false;},attention(active){director.listen(active);}});requestAnimationFrame(tick);}catch(e){$('#error').textContent='模型载入失败：'+String(e)+'。请刷新页面重试。';status.textContent='模型未载入';}

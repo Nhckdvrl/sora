@@ -74,3 +74,30 @@ test('provider concurrency and rate limits are separate from exhausted plan cred
   assert.ok(!JSON.stringify(body).includes('current: 9'));
  }
 });
+
+function wavFixture(){
+ const b=Buffer.alloc(44+16000*2);b.write('RIFF');b.writeUInt32LE(b.length-8,4);b.write('WAVE',8);b.write('fmt ',12);b.writeUInt32LE(16,16);b.writeUInt16LE(1,20);b.writeUInt16LE(1,22);b.writeUInt32LE(16000,24);b.writeUInt32LE(32000,28);b.writeUInt16LE(2,32);b.writeUInt16LE(16,34);b.write('data',36);b.writeUInt32LE(b.length-44,40);return b.toString('base64');
+}
+test('ASR validates bounded WAV audio and uses only the Plan 2.5 SSE endpoint',async t=>{
+ const env=setup();t.after(()=>env.DB.close());const calls=[];
+ const api=createGateway({fetchUpstream:async(url,init)=>{calls.push({url,init,body:JSON.parse(init.body)});return new Response('data: '+JSON.stringify({type:'transcript.text.delta',delta:'你'})+'\n\ndata: '+JSON.stringify({type:'transcript.text.done',text:'你好，天。'})+'\n\n',{headers:{'Content-Type':'text/event-stream'}});}});
+ const invalid=await api(req('asr',{audio:'not-a-wav'}),env);assert.equal(invalid.status,400);assert.equal(calls.length,0);
+ const response=await api(req('asr',{audio:wavFixture(),model:'cash-model'}),env);assert.equal(response.status,200);assert.equal((await response.json()).text,'你好，天。');
+ assert.equal(calls[0].url,'https://api.stepfun.com/step_plan/v1/audio/asr/sse');assert.equal(calls[0].init.headers.Accept,'text/event-stream');assert.equal(calls[0].body.audio.input.transcription.model,'stepaudio-2.5-asr');
+});
+test('incomplete ASR output is never treated as a completed user utterance',async t=>{
+ const env=setup();t.after(()=>env.DB.close());
+ const api=createGateway({fetchUpstream:async()=>new Response('data: '+JSON.stringify({type:'transcript.text.delta',delta:'半句话'})+'\n\n')});
+ const response=await api(req('asr',{audio:wavFixture()}),env);assert.equal(response.status,502);assert.equal((await response.json()).error,'asr_incomplete');
+});
+test('preset testing is explicit and never presented as the cloned character voice',async t=>{
+ const env=setup();delete env.STEP_VOICE_ID;env.STEP_VOICE_MODE='preset-test';t.after(()=>env.DB.close());let used;
+ const api=createGateway({fetchUpstream:async(url,init)=>{if(url.endsWith('/audio/speech')){used=JSON.parse(init.body).voice;return new Response(new Uint8Array([73,68,51]),{headers:{'content-type':'audio/mpeg'}});}return completion();}});
+ const health=await(await api(new Request('https://sora.test/api/health'),env)).json();assert.equal(health.voiceKind,'preset-test');assert.equal(health.voiceReady,true);
+ const reply=await(await api(req('chat',{message:'hi'}),env)).json();assert.equal((await api(req('speech',{ticket:reply.ticket}),env)).status,200);assert.equal(used,'yuanqishaonv');
+});
+test('model performance cues are bounded and raw rig controls cannot pass through',async t=>{
+ const env=setup();t.after(()=>env.DB.close());
+ const api=createGateway({fetchUpstream:async()=>Response.json({choices:[{finish_reason:'stop',message:{content:JSON.stringify({reply:'我们慢慢来。',emotion:'worried',gesture:'bow',performance:{intensity:900,cues:[{at:-1,emotion:'happy',gesture:'wave'},{at:.2,emotion:'neutral',gesture:'execute'},{at:.5,emotion:'serious',gesture:'nod',ParamAngleX:99}]}})}}]})});
+ const reply=await(await api(req('chat',{message:'hi'}),env)).json();assert.equal(reply.gesture,'nod');assert.equal(reply.performance.intensity,.85);assert.equal(reply.performance.cues[0].at,0);assert.equal(reply.performance.cues.length,2);assert.ok(!JSON.stringify(reply).includes('ParamAngleX'));
+});

@@ -1,21 +1,23 @@
 import {characterContext} from './character-memory.mjs';
-const MODELS={chat:'step-5-preview',speech:'stepaudio-2.5-tts'};
+const MODELS={chat:'step-5-preview',speech:'stepaudio-2.5-tts',asr:'stepaudio-2.5-asr'};
 const EMOTIONS=new Set(['neutral','happy','shy','confident','worried','playful','serious']);
-const GESTURES=new Set(['none','wave','hand','bow']);
+const GESTURES=new Set(['none','nod','shake','tilt','wave','hand']);
 const hasVoice=env=>typeof env.STEP_VOICE_ID==='string'&&/^voice-[a-zA-Z0-9_-]{3,200}$/.test(env.STEP_VOICE_ID);
-const SYSTEM=`你是“新海天·天色微风”的非官方 AI 角色，语气元气、俏皮、体贴，用自然简短的中文聊天，不冒充真人或原作官方。不要声称看到了摄像头、屏幕或用户的位置。保持日常、非露骨的交流。每次回答 1–3 句，通常 30–100 字，最多 160 字。只返回 JSON：{"reply":"要说的话","emotion":"neutral|happy|shy|confident|worried|playful|serious","gesture":"none|wave|hand|bow"}。动作要克制，普通对话使用 none，问好可以 wave，鼓励可以 hand。不要在 reply 中加入舞台说明、括号指令、Markdown 或 JSON 之外的内容。`;
+const voiceFor=env=>hasVoice(env)?env.STEP_VOICE_ID:env.STEP_VOICE_MODE==='preset-test'?(env.STEP_REGION==='global'?'lively-girl':'yuanqishaonv'):null;
+const SYSTEM=`你是“新海天·天色微风”的非官方 AI 角色，语气元气、俏皮、体贴，用自然简短的中文聊天，不冒充真人或原作官方。不要声称看到了摄像头、屏幕或用户的位置。保持日常、非露骨的交流。每次回答 1–3 句，通常 30–100 字，最多 160 字。只返回 JSON：{"reply":"要说的话","emotion":"neutral|happy|shy|confident|worried|playful|serious","gesture":"none|nod|shake|tilt|wave|hand"}。动作要克制，普通对话使用 none，问好可以 wave，鼓励可以 nod。不要在 reply 中加入舞台说明、括号指令、Markdown 或 JSON 之外的内容。`;
 const enc=new TextEncoder();
+const PERFORMANCE_INSTRUCTION='在 JSON 中增加 performance：{"intensity":0.25到0.85,"cues":[{"at":0,"emotion":"同上七种情绪之一","gesture":"none|nod|shake|tilt|wave|hand"}]}。cues 最多3条，at 是回复进度0到0.85，第一条at=0；只在语意变化时换情绪，不要每句都表演。gesture优先none或nod，疑惑可tilt，否定可shake，只在明确问好/击掌时wave/hand。情绪根据本次语意判断，否定句不按关键词反向误判。intensity是表现幅度，不代表对用户情绪的确信程度。';
 class PublicError extends Error{constructor(status,code,message,retryAfter=0){super(message);this.status=status;this.code=code;this.retryAfter=retryAfter;}}
 const clean=(s,max)=>Array.from(s.trim()).slice(0,max).join('');
 const limit=(value,fallback,max)=>Math.max(1,Math.min(max,Number(value)||fallback));
 const b64=bytes=>btoa(String.fromCharCode(...new Uint8Array(bytes))).replaceAll('+','-').replaceAll('/','_').replace(/=+$/,'');
 const unb64=value=>Uint8Array.from(atob(value.replaceAll('-','+').replaceAll('_','/')),c=>c.charCodeAt(0));
 
-async function readJSON(request){
+async function readJSON(request,maxBytes=16000){
  if(!request.headers.get('content-type')?.startsWith('application/json'))throw new PublicError(415,'json_required','请发送 JSON 请求。');
  const reader=request.body?.getReader();if(!reader)throw new PublicError(400,'invalid_request','请求内容为空。');
  const chunks=[];let size=0;
- for(;;){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>16000){await reader.cancel();throw new PublicError(413,'request_too_large','这条消息太长了。');}chunks.push(value);}
+ for(;;){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>maxBytes){await reader.cancel();throw new PublicError(413,'request_too_large','这次发送的内容太长了。');}chunks.push(value);}
  const bytes=new Uint8Array(size);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.length;}
  try{return JSON.parse(new TextDecoder().decode(bytes));}catch{throw new PublicError(400,'invalid_json','请求格式不正确。');}
 }
@@ -55,7 +57,26 @@ function modelReply(data){
  content=content.replace(/^\s*```(?:json)?\s*/,'').replace(/\s*```\s*$/,'');
  let result;try{result=JSON.parse(content);}catch{throw new PublicError(502,'invalid_reply','这次回应没有整理好，请稍后再试。');}
  if(typeof result.reply!=='string'||!result.reply.trim())throw new PublicError(502,'invalid_reply','这次没有收到完整回应。');
- return {reply:clean(result.reply,160),emotion:EMOTIONS.has(result.emotion)?result.emotion:'neutral',gesture:GESTURES.has(result.gesture)?result.gesture:'none'};
+ const emotion=EMOTIONS.has(result.emotion)?result.emotion:'neutral',gesture=GESTURES.has(result.gesture)?result.gesture:result.gesture==='bow'?'nod':'none';
+ const raw=result.performance,intensity=typeof raw?.intensity==='number'&&Number.isFinite(raw.intensity)?Math.max(.25,Math.min(.85,raw.intensity)):.6;
+ const cues=Array.isArray(raw?.cues)?raw.cues.filter(c=>c&&Number.isFinite(c.at)&&c.at>=0&&c.at<=.85&&EMOTIONS.has(c.emotion)&&GESTURES.has(c.gesture)).slice(0,3).map(c=>({at:c.at,emotion:c.emotion,gesture:c.gesture})).sort((a,b)=>a.at-b.at):[];
+ if(!cues.length||cues[0].at!==0)cues.unshift({at:0,emotion,gesture});
+ return {reply:clean(result.reply,160),emotion,gesture,performance:{intensity,cues:cues.slice(0,3)}};
+}
+function validateAudio(value){
+ try{
+  if(typeof value!=='string'||value.length>870000||!/^[A-Za-z0-9+/]+={0,2}$/.test(value))throw Error();
+  const bytes=Uint8Array.from(atob(value),c=>c.charCodeAt(0)),v=new DataView(bytes.buffer),tag=(i)=>String.fromCharCode(...bytes.subarray(i,i+4));
+  if(bytes.length<44||bytes.length>650000||tag(0)!=='RIFF'||tag(8)!=='WAVE'||v.getUint32(4,true)+8!==bytes.length)throw Error();
+  let valid=false,length=0;
+  for(let i=12;i+8<=bytes.length;){const size=v.getUint32(i+4,true),start=i+8;if(start+size>bytes.length)throw Error();if(tag(i)==='fmt '){if(size<16||v.getUint16(start,true)!==1||v.getUint16(start+2,true)!==1||v.getUint32(start+4,true)!==16000||v.getUint16(start+14,true)!==16)throw Error();valid=true;}if(tag(i)==='data')length+=size;i=start+size+(size%2);}
+  if(!valid||length<11200||length>640000||length%2)throw Error();return value;
+ }catch{throw new PublicError(400,'invalid_audio','请录制 0.35–20 秒的语音。');}
+}
+async function transcript(response){
+ let text='',done=false;
+ for(const line of (await response.text()).split(/\r?\n/)){if(!line.startsWith('data:'))continue;const raw=line.slice(5).trim();if(!raw||raw==='[DONE]')continue;let event;try{event=JSON.parse(raw);}catch{continue;}if(event.type==='error')throw new PublicError(502,'asr_failed','刚才没有听清，请再说一遍。');if(event.type==='transcript.text.delta'&&typeof event.delta==='string')text+=event.delta;if(event.type==='transcript.text.done'&&typeof event.text==='string'){text=event.text;done=true;}}
+ if(!done)throw new PublicError(502,'asr_incomplete','这句语音没有识别完整，请再说一遍。');return clean(text,500);
 }
 export function createGateway({fetchUpstream=(...args)=>fetch(...args),clock=Date.now}={}){
  async function post(path,payload,env,request){
@@ -66,7 +87,7 @@ export function createGateway({fetchUpstream=(...args)=>fetch(...args),clock=Dat
   const cancel=new AbortController(),abort=()=>cancel.abort(),timer=setTimeout(abort,55000);
   request.signal?.addEventListener('abort',abort,{once:true});
   try{
-   response=await fetchUpstream(url,{method:'POST',redirect:'manual',headers:{Authorization:`Bearer ${env.STEPFUN_API_KEY}`,'Content-Type':'application/json'},body:JSON.stringify(payload),signal:cancel.signal});
+   response=await fetchUpstream(url,{method:'POST',redirect:'manual',headers:{Authorization:`Bearer ${env.STEPFUN_API_KEY}`,'Content-Type':'application/json',...(path==='audio/asr/sse'?{Accept:'text/event-stream'}:{})},body:JSON.stringify(payload),signal:cancel.signal});
    // Read within the timeout, including streamed speech. No modern AbortSignal helpers required.
    {const reader=response.body?.getReader(),chunks=[];let size=0;const max=response.ok?4000000:4096;if(reader)for(;;){const {done,value}=await reader.read();if(done)break;if(size+value.length>max){if(response.ok){await reader.cancel();throw Error('upstream_body_limit');}chunks.push(value.subarray(0,max-size));size=max;await reader.cancel();break;}size+=value.length;chunks.push(value);}const bytes=new Uint8Array(size);let i=0;for(const chunk of chunks){bytes.set(chunk,i);i+=chunk.length;}response=new Response(bytes,{status:response.status,headers:response.headers});}
   }
@@ -95,24 +116,29 @@ export function createGateway({fetchUpstream=(...args)=>fetch(...args),clock=Dat
   const json=(value,status=200)=>Response.json(value,{status,headers});
   if(origin&&!allowed.has(origin))return json({error:'origin_not_allowed',message:'此页面暂不支持连接。'},403);
   if(request.method==='OPTIONS')return new Response(null,{status:204,headers});
-  if(request.method==='GET'&&['/','/api/health'].includes(url.pathname))return json({service:'sora-ai',tokenPlanOnly:true,models:MODELS,voiceReady:hasVoice(env),ready:!!(env.STEPFUN_API_KEY&&env.TICKET_SECRET&&env.DB)});
-  if(request.method!=='POST'||!['/api/chat','/api/speech'].includes(url.pathname))return json({error:'not_found'},404);
+  if(request.method==='GET'&&['/','/api/health'].includes(url.pathname))return json({service:'sora-ai',tokenPlanOnly:true,models:MODELS,voiceReady:!!voiceFor(env),voiceKind:hasVoice(env)?'cloned':voiceFor(env)?'preset-test':'none',asrReady:true,ready:!!(env.STEPFUN_API_KEY&&env.TICKET_SECRET&&env.DB)});
+  if(request.method!=='POST'||!['/api/chat','/api/speech','/api/asr'].includes(url.pathname))return json({error:'not_found'},404);
   if(!origin)return json({error:'origin_required',message:'请从互动页面开始聊天。'},403);
   if(!env.STEPFUN_API_KEY||!env.TICKET_SECRET||!env.DB)return json({error:'not_ready',message:'对话服务正在准备中。'},503);
   try{
-   const now=clock(),body=await readJSON(request);
+   const now=clock(),body=await readJSON(request,url.pathname==='/api/asr'?900000:16000);
+   if(url.pathname==='/api/asr'){
+    const audio=validateAudio(body?.audio);await reserveQuota(request,env,now);
+    const upstream=await post('audio/asr/sse',{audio:{data:audio,input:{transcription:{language:'zh',model:MODELS.asr,enable_itn:true},format:{type:'wav'}}}},env,request);
+    return json({text:await transcript(upstream)});
+   }
    if(url.pathname==='/api/chat'){
     const input=requestValues(body);await reserveQuota(request,env,now);
-    const upstream=await post('chat/completions',{model:MODELS.chat,messages:[{role:'system',content:SYSTEM},{role:'system',content:characterContext(input.message)},...input.history,{role:'user',content:input.message}],reasoning_effort:'low',max_tokens:1200,response_format:{type:'json_object'}},env,request);
+    const upstream=await post('chat/completions',{model:MODELS.chat,messages:[{role:'system',content:SYSTEM+PERFORMANCE_INSTRUCTION},{role:'system',content:characterContext(input.message)},...input.history,{role:'user',content:input.message}],reasoning_effort:'low',max_tokens:1200,response_format:{type:'json_object'}},env,request);
     let data;try{data=await upstream.json();}catch{throw new PublicError(502,'invalid_reply','回应暂时没有传完整。');}
     const reply=modelReply(data);return json({...reply,ticket:await makeTicket(reply.reply,reply.emotion,env,now)});
    }
-   if(!hasVoice(env))throw new PublicError(503,'voice_not_ready','天的原作参考音色还在准备中，可以先文字聊天。');
+   if(!voiceFor(env))throw new PublicError(503,'voice_not_ready','语音还在准备中，可以先文字聊天。');
    const ticket=await verifyTicket(body?.ticket,env,now);await reserveQuota(request,env,now);
    const consumed=await env.DB.prepare('INSERT INTO speech_uses (id,expires_at) VALUES (?,?) ON CONFLICT(id) DO NOTHING RETURNING id').bind(ticket.id,Math.floor(ticket.expires/1000)).all();
    if(!consumed.results?.length)throw new PublicError(409,'speech_already_requested','这句语音已经生成过，请使用重播按钮。');
    const tones={happy:'活泼、明亮，像和熟悉的朋友轻松聊天。',shy:'轻柔，略微害羞，自然停顿，不夸张。',worried:'关切、温和，不要哭腔。',serious:'认真但亲切，清晰自然。'};
-   const upstream=await post('audio/speech',{model:MODELS.speech,voice:env.STEP_VOICE_ID,input:ticket.reply,language:'zh',response_format:'mp3',speed:1.0,instruction:tones[ticket.emotion]??'保留参考音色的声线与音高，自然轻松地和熟悉的朋友聊天，不要播音腔。'},env,request);
+   const upstream=await post('audio/speech',{model:MODELS.speech,voice:voiceFor(env),input:ticket.reply,language:'zh',response_format:'mp3',speed:1.0,instruction:tones[ticket.emotion]??'自然轻松地和熟悉的朋友聊天，语气年轻、亲切，不要播音腔。'},env,request);
    const type=upstream.headers.get('content-type')??'';
    if(!/audio|octet-stream/i.test(type)){await upstream.body?.cancel();throw new PublicError(502,'invalid_audio','语音暂时没有生成成功，文字仍可查看。');}
    return new Response(upstream.body,{headers:{...headers,'Content-Type':'audio/mpeg'}});

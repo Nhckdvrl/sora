@@ -1,12 +1,14 @@
 import {requestPlan} from './plan-request';
-export type AIReply={reply:string;emotion:string;gesture:string;ticket:string};
-export interface ConversationController {mouthOpen():number|null;stop():void;}
+import {ContinuousVoice} from './continuous-voice';
+import type {PerformanceReply,DialoguePhase} from './performance';
+export type AIReply=PerformanceReply&{ticket:string};
+export interface ConversationController {mouthOpen():number|null;speechProgress():number|null;stop():void;}
 const GATEWAY='https://sora-breeze-api-nhckdvrl.nhckdvrl.chatgpt.site';
-export function initConversation(callbacks:{thinking():void;reply(value:AIReply):void;error(message:string):void}):ConversationController{
+export function initConversation(callbacks:{thinking():void;reply(value:AIReply):void;error(message:string):void;phase(value:DialoguePhase|'finished'):void;attention(active:boolean):void}):ConversationController{
  const $=<T extends HTMLElement>(id:string)=>document.getElementById(id) as T;
- const form=$<HTMLFormElement>('chat-form'),input=$<HTMLTextAreaElement>('chat-input'),send=$<HTMLButtonElement>('chat-send'),stopButton=$<HTMLButtonElement>('chat-stop'),replay=$<HTMLButtonElement>('chat-replay'),voice=$<HTMLInputElement>('chat-voice'),state=$('chat-state'),log=$('chat-log');
+ const form=$<HTMLFormElement>('chat-form'),input=$<HTMLTextAreaElement>('chat-input'),send=$<HTMLButtonElement>('chat-send'),stopButton=$<HTMLButtonElement>('chat-stop'),replay=$<HTMLButtonElement>('chat-replay'),voice=$<HTMLInputElement>('chat-voice'),state=$('chat-state'),log=$('chat-log'),voiceButton=$<HTMLButtonElement>('voice-connect'),voiceState=$('voice-state'),voiceLevel=$<HTMLMeterElement>('voice-level'),voiceLabel=$('voice-label');
  let history:{role:'user'|'assistant';content:string}[]=[],epoch=0,busy=false,controller:AbortController|null=null;
- let context:AudioContext|null=null,analyser:AnalyserNode|null=null,source:AudioBufferSourceNode|null=null,cached:AudioBuffer|null=null,mouth=0;
+ let context:AudioContext|null=null,analyser:AnalyserNode|null=null,source:AudioBufferSourceNode|null=null,cached:AudioBuffer|null=null,mouth=0,sourceStarted=0;
  const samples=new Float32Array(512);
  function status(text:string){state.textContent=text;send.disabled=busy;stopButton.disabled=!busy&&!source;replay.disabled=!cached||busy;}
  function message(who:'user'|'assistant',text:string){const row=document.createElement('div');row.className='chat-message '+who;const name=document.createElement('span');name.className='chat-author';name.textContent=who==='user'?'你':'天';const content=document.createElement('p');content.textContent=text;row.append(name,content);log.append(row);while(log.children.length>8)log.firstElementChild?.remove();log.scrollTop=log.scrollHeight;}
@@ -15,15 +17,30 @@ export function initConversation(callbacks:{thinking():void;reply(value:AIReply)
   return context;
  }
  function stopSound(){const prior=source;source=null;if(prior){prior.onended=null;try{prior.stop();}catch{}prior.disconnect();}mouth=0;}
- function stop(){epoch++;controller?.abort();controller=null;stopSound();busy=false;status('已停下 · 可以继续聊');}
+ function stop(){
+  if(source&&history.at(-1)?.role==='assistant'&&!history.at(-1)!.content.startsWith('〔语音被打断'))history.at(-1)!.content='〔语音被打断，完整文字已显示，但语音未完整播出〕'+history.at(-1)!.content;
+  epoch++;controller?.abort();controller=null;microphone.cancelPending();stopSound();busy=false;callbacks.phase('interrupted');status('已停下 · 可以继续聊');
+ }
  async function play(buffer:AudioBuffer){
   const current=epoch,audio=audioContext();await audio.resume();if(current!==epoch)return;if(audio.state!=='running')throw Error('请点击重播，允许浏览器播放声音。');
   stopSound();const next=audio.createBufferSource();next.buffer=buffer;next.connect(analyser!);source=next;
-  next.onended=()=>{if(source!==next)return;source=null;mouth=0;status('听着呢');next.disconnect();};next.start();status('正在说话…');
+  next.onended=()=>{if(source!==next)return;source=null;mouth=0;status('听着呢');callbacks.phase('finished');next.disconnect();};sourceStarted=audio.currentTime;next.start();callbacks.phase('speaking');status('正在说话…');
  }
  async function post(path:string,body:unknown,signal:AbortSignal){
-  return requestPlan(GATEWAY+'/api/'+path,body,{signal,onAttempt(){if(path==='chat')status('正在想一想…');},onRetry({seconds,attempt,limit}){status(`模型忙 · ${seconds} 秒后重试（${attempt}/${limit}）`);}});
+  return requestPlan(GATEWAY+'/api/'+path,body,{signal,onAttempt(){if(path==='chat'){callbacks.phase('thinking');status('正在想一想…');}},onRetry({seconds,attempt,limit}){callbacks.phase('waiting');status(`模型忙 · ${seconds} 秒后重试（${attempt}/${limit}）`);}});
  }
+ const microphone=new ContinuousVoice({
+  speechStarted(){stop();callbacks.phase('listening');},
+  transcribed(text){input.value=text;form.requestSubmit();},
+  status(text){voiceState.textContent=text;voiceButton.textContent=microphone.active?'停止语音':'开始语音';voiceButton.setAttribute('aria-pressed',String(microphone.active));},
+  level(value){voiceLevel.value=value;},
+  playing:()=>({active:!!source,age:context?context.currentTime-sourceStarted:0}),
+  async recognize(audio,signal){callbacks.phase('thinking');try{const response=await post('asr',{audio},signal),result=await response.json();if(signal.aborted)throw new DOMException('已打断','AbortError');if(typeof result.text!=='string')throw Error('语音识别没有完成。');if(!result.text.trim())callbacks.phase('listening');return result.text;}catch(error){if(!signal.aborted)callbacks.phase('error');throw error;}}
+ });
+ voiceButton.addEventListener('click',()=>{
+  if(microphone.active){microphone.stop();stop();voiceState.textContent='麦克风已关闭';voiceButton.textContent='开始语音';voiceButton.setAttribute('aria-pressed','false');}
+  else{try{void audioContext().resume().catch(()=>{});}catch{}void microphone.start();}
+ });
  form.addEventListener('submit',async event=>{
   event.preventDefault();if(busy)return;const text=input.value.trim();if(!text)return;
   if(Array.from(text).length>500){status('一条消息最多 500 字哦');return;}
@@ -47,15 +64,19 @@ export function initConversation(callbacks:{thinking():void;reply(value:AIReply)
    if(current!==epoch)return;busy=false;if(!input.value.trim())input.value=text;const detail=error instanceof Error?error.message:'连接暂时不顺畅，请稍后再试。';status(detail);callbacks.error(detail);
   }finally{if(current===epoch){busy=false;controller=null;send.disabled=false;stopButton.disabled=!source;replay.disabled=!cached;}}
  });
- stopButton.addEventListener('click',stop);
+ stopButton.addEventListener('click',()=>stop());
  replay.addEventListener('click',()=>{if(cached)void play(cached).catch(error=>status(String(error.message??error)));});
  voice.addEventListener('change',()=>{if(!voice.checked){stopSound();status(busy?'正在回应…':'已关闭朗读');}});
  input.addEventListener('keydown',event=>{if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing){event.preventDefault();form.requestSubmit();}});
+ input.addEventListener('focus',()=>callbacks.attention(true));input.addEventListener('blur',()=>callbacks.attention(false));
+ const closeMicrophone=()=>{if(microphone.active){microphone.stop();stop();voiceState.textContent='麦克风已关闭';voiceButton.textContent='开始语音';voiceButton.setAttribute('aria-pressed','false');}};
+ document.addEventListener('visibilitychange',()=>{if(document.hidden)closeMicrophone();});window.addEventListener('pagehide',()=>{closeMicrophone();stopSound();void context?.close().catch(()=>{});},{once:true});
  send.disabled=false;status('听着呢');
  voice.checked=false;voice.disabled=true;
  void fetch(GATEWAY+'/api/health').then(response=>{if(!response.ok)throw Error();return response.json();}).then(health=>{
-  if(health.voiceReady===true){voice.disabled=false;voice.checked=true;if(!busy)status('听着呢');}
+  if(health.voiceReady===true){voice.disabled=false;voice.checked=true;voiceLabel.textContent=health.voiceKind==='preset-test'?'测试音色朗读':'原作参考音色';if(!busy)status('听着呢');}
   else if(!busy)status('可以文字聊天 · 原作音色准备中');
- }).catch(()=>{if(!busy)status('可以尝试文字聊天 · 音色服务暂不可用');});
- return {stop,mouthOpen(){if(!source||!analyser||context?.state!=='running')return null;analyser.getFloatTimeDomainData(samples);let sum=0;for(const sample of samples)sum+=sample*sample;const target=Math.max(0,Math.min(1,(Math.sqrt(sum/samples.length)-.008)*9));mouth+=(target-mouth)*.55;return mouth;}};
+  voiceButton.disabled=!(health.ready&&health.asrReady===true);if(voiceButton.disabled)voiceState.textContent='语音服务正在准备，可先文字聊天。';
+ }).catch(()=>{voiceButton.disabled=true;voiceState.textContent='语音服务暂未连接，可稍后刷新重试。';if(!busy)status('可以尝试文字聊天 · 音色服务暂不可用');});
+ return {stop,speechProgress(){return source?.buffer&&context?Math.min(1,(context.currentTime-sourceStarted)/source.buffer.duration):null;},mouthOpen(){if(!source||!analyser||context?.state!=='running')return null;analyser.getFloatTimeDomainData(samples);let sum=0;for(const sample of samples)sum+=sample*sample;const target=Math.max(0,Math.min(1,(Math.sqrt(sum/samples.length)-.008)*9));mouth+=(target-mouth)*.55;return mouth;}};
 }
