@@ -1,0 +1,24 @@
+{
+  "name": "sora-breeze",
+  "version": "0.3.1",
+  "private": true,
+  "type": "module",
+  "engines": { "node": "^22.12.0 || >=24.0.0" },
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 5182 --strictPort",
+    "build": "npm run build --workspace=@standrig/core && npm run build --workspace=@standrig/runtime && tsc --noEmit && vite build && node scripts/check-static.mjs",
+    "preview": "vite preview --host 127.0.0.1 --port 5182 --strictPort",
+    "preview:pages": "node scripts/preview-pages.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@standrig/core": "0.2.0",
+    "@standrig/runtime": "0.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.2",
+    "typescript": "5.9.3",
+    "vite": "8.1.3"
+  }
+}
