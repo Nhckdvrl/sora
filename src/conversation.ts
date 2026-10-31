@@ -69,6 +69,8 @@ export function initConversation(callbacks:{thinking():void;reply(value:AIReply)
  voice.addEventListener('change',()=>{if(!voice.checked){stopSound();status(busy?'正在回应…':'已关闭朗读');}});
  input.addEventListener('keydown',event=>{if(event.key==='Enter'&&!event.shiftKey&&!event.isComposing){event.preventDefault();form.requestSubmit();}});
  input.addEventListener('focus',()=>callbacks.attention(true));input.addEventListener('blur',()=>callbacks.attention(false));
+ input.addEventListener('input',()=>callbacks.attention(document.activeElement===input));
+ callbacks.attention(document.activeElement===input);
  const closeMicrophone=()=>{if(microphone.active){microphone.stop();stop();voiceState.textContent='麦克风已关闭';voiceButton.textContent='开始语音';voiceButton.setAttribute('aria-pressed','false');}};
  document.addEventListener('visibilitychange',()=>{if(document.hidden)closeMicrophone();});window.addEventListener('pagehide',()=>{closeMicrophone();stopSound();void context?.close().catch(()=>{});},{once:true});
  send.disabled=false;status('听着呢');
