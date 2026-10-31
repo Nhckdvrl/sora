@@ -4,12 +4,14 @@ import { triangleUvAtPoint } from '@standrig/core/hitTesting';
 import type { ParameterValues } from '@standrig/core/types';
 import { reactions, reactionAt, faceReactionPose, type ReactionKind } from './sora-reactions';
 import {sampleGesture,advanceGesture,type GesturePose} from './sora-gestures';
+import {initConversation,type ConversationController,type AIReply} from './conversation';
 import './sora.css';
 
 const $=<T extends HTMLElement>(s:string)=>document.querySelector<T>(s)!;
 const canvas=$<HTMLCanvasElement>('#sora-canvas'),stage=$('#stage'),scene=$('.stage-column');
 const names=['自然','开心','害羞','得意','担心','坏笑','含泪','俏皮','撒娇','认真','单眼眨眼','轻闭双眼'];
 const status=$('#status'),exportStatus=$('#export-status'),feedback=$('#touch-feedback'),hint=$('#interaction-hint');
+let conversation:ConversationController|undefined;
 let expression=0,paused=false,portrait=true,background=0,ready=false,runtime:RigRuntime,modelSource='';
 let pointer={x:0,y:0},look={x:0,y:0},eyeTarget={x:0,y:0},gaze={x:0,y:0};
 let last=performance.now(),lastRender=0,elapsed=0,nextBlink=2.8,blinkStart=-1;
@@ -37,6 +39,7 @@ function selectExpression(i:number,transient=false){
 }
 function touch(kind:ReactionKind,p:{x:number;y:number}){
  if(!ready)return;
+ if(kind==='mouth')conversation?.stop();
  const def=reactions.find(r=>r.id===kind)!,prior=history.get(kind);
  const count=prior&&elapsed-prior.at<2.8?prior.count+1:1;history.set(kind,{at:elapsed,count});
  const base=reaction?.base??expression;reaction={kind,start:elapsed,until:elapsed+def.duration,base,side:p.x<684?-1:1};
@@ -77,7 +80,7 @@ for(const id of ['yaw','pitch','roll'])$<HTMLInputElement>('#'+id).oninput=()=>{
 $('#wink').onclick=()=>touch('eye',{x:727,y:302});
 $('#greet').onclick=()=>{greetUntil=elapsed+3.25;touch('wave',{x:490,y:313});};
 $('#breeze').onclick=()=>{touch('ponytail',{x:879,y:430});breezeUntil=elapsed+3.2;feedback.textContent='风来了，头发都飘起来啦。';};
-$('#reset').onclick=()=>{selectExpression(0);pointer=look={x:0,y:0};eyeTarget=gaze={x:0,y:0};hairImpulse=0;breezeUntil=0;dragging=false;history.clear();runtime?.resetPhysics();for(const id of ['yaw','pitch','roll']){$<HTMLInputElement>('#'+id).value='0';$('#'+id+'-value').textContent='0';}};
+$('#reset').onclick=()=>{conversation?.stop();selectExpression(0);pointer=look={x:0,y:0};eyeTarget=gaze={x:0,y:0};hairImpulse=0;breezeUntil=0;dragging=false;history.clear();runtime?.resetPhysics();for(const id of ['yaw','pitch','roll']){$<HTMLInputElement>('#'+id).value='0';$('#'+id+'-value').textContent='0';}};
 $('#portrait').onclick=()=>{portrait=!portrait;$('#portrait').setAttribute('aria-pressed',String(portrait));$('#portrait').textContent=portrait?'全身立绘':'半身近景';};
 $('#background').onclick=()=>{background=(background+1)%3;stage.classList.toggle('night',background===1);stage.classList.toggle('clear',background===2);$('#background').textContent='背景 · '+['晴空','暮蓝','透明'][background];};
 $('#fullscreen').onclick=()=>{if(document.fullscreenElement)void document.exitFullscreen();else void scene.requestFullscreen();};
@@ -92,7 +95,7 @@ $('#record').onclick=()=>{
  const capture=()=>{ctx.fillStyle=background===1?'#2e405c':'#eaf3fa';ctx.fillRect(0,0,960,1280);const scale=Math.min(960/canvas.width,1280/canvas.height);ctx.drawImage(canvas,(960-canvas.width*scale)/2,(1280-canvas.height*scale)/2,canvas.width*scale,canvas.height*scale);if(performance.now()-start>=8000){recorder.stop();return;}frame=requestAnimationFrame(capture);};
  recorder.ondataavailable=e=>{if(e.data.size)chunks.push(e.data);};recorder.onstop=()=>{cancelAnimationFrame(frame);stream.getTracks().forEach(t=>t.stop());download(new Blob(chunks,{type:mime}),'新海天_天色微风_v0.3.1_8s.webm');recording=false;b.disabled=false;b.textContent='录制 8 秒动态';exportStatus.textContent='已保存 8 秒 WebM 动态（无音轨）';};recorder.start(500);b.textContent='正在录制…';exportStatus.textContent='保持页面可见，8 秒后自动下载';capture();
 };
-document.addEventListener('keydown',e=>{if(e.target instanceof HTMLInputElement||e.target instanceof HTMLButtonElement||e.ctrlKey||e.metaKey||e.altKey)return;if(e.code==='Space'){e.preventDefault();paused=!paused;status.textContent=paused?'动作已暂停':'原作模型 · 轻动态';}else if(e.key.toLowerCase()==='f')$('#fullscreen').click();else if(/^[1-9]$/.test(e.key))selectExpression(Number(e.key)-1);});
+document.addEventListener('keydown',e=>{if((e.target instanceof HTMLElement&&e.target.closest('input,textarea,select,button,[contenteditable="true"]'))||e.ctrlKey||e.metaKey||e.altKey)return;if(e.code==='Space'){e.preventDefault();paused=!paused;status.textContent=paused?'动作已暂停':'原作模型 · 轻动态';}else if(e.key.toLowerCase()==='f')$('#fullscreen').click();else if(/^[1-9]$/.test(e.key))selectExpression(Number(e.key)-1);});
 function tick(now:number){
  requestAnimationFrame(tick);if(!ready||document.hidden||now-lastRender<1000/30)return;const dt=Math.min(.1,(now-last)/1000);last=now;lastRender=now;if(paused)return;elapsed+=dt;
  const t=elapsed,idle=enabled('idle'),follow=enabled('follow'),eyeFollow=enabled('gaze'),headEase=1-Math.exp(-dt*6.5),eyeEase=1-Math.exp(-dt*22);
@@ -108,6 +111,7 @@ function tick(now:number){
  if(idle&&!reaction){targetGesture.ParamArmRShoulder=.6*Math.sin(t*.85+.4);targetGesture.ParamArmRElbow=.45*Math.sin(t*.85-.3);targetGesture.ParamArmLWrist=.35*Math.sin(t*.7);}
  advanceGesture(gesturePose,gestureVelocity,targetGesture,dt);
  Object.assign(values,gesturePose,faceReactionPose(reaction?.kind??null,age,def?.duration??0));
+ const speechMouth=conversation?.mouthOpen();if(speechMouth!==undefined&&speechMouth!==null)values.ParamMouthOpen=speechMouth;
  const started=performance.now();runtime.render(canvas,values,camera());canvas.dataset.ready='true';canvas.dataset.expression=String(expression);canvas.dataset.time=t.toFixed(3);canvas.dataset.pose=JSON.stringify(values);canvas.dataset.frameMs=(performance.now()-started).toFixed(1);
 }
-try{const model=await loadSoraModel();modelSource=model.source;runtime=new RigRuntime(model.rig,{cacheEvaluation:true});await runtime.loadAssets();ready=true;status.textContent='原作模型 · 目光与发丝';requestAnimationFrame(tick);}catch(e){$('#error').textContent='模型载入失败：'+String(e)+'。请刷新页面重试。';status.textContent='模型未载入';}
+try{const model=await loadSoraModel();modelSource=model.source;runtime=new RigRuntime(model.rig,{cacheEvaluation:true});await runtime.loadAssets();ready=true;status.textContent='原作模型 · 目光与发丝';conversation=initConversation({thinking(){selectExpression(9);feedback.textContent='让我想一想……';},reply(reply:AIReply){const emotions:Record<string,number>={neutral:0,happy:1,shy:2,confident:3,worried:4,playful:7,serious:9};selectExpression(emotions[reply.emotion]??0);if(['wave','hand','bow'].includes(reply.gesture)){const action=reactions.find(r=>r.id===reply.gesture)!;touch(action.id,{x:action.anchor[0],y:action.anchor[1]});}feedback.textContent=reply.reply;feedback.classList.add('visible');},error(message:string){selectExpression(0);feedback.textContent=message;}});requestAnimationFrame(tick);}catch(e){$('#error').textContent='模型载入失败：'+String(e)+'。请刷新页面重试。';status.textContent='模型未载入';}
