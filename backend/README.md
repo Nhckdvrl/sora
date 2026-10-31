@@ -1,6 +1,6 @@
 # Sora AI gateway
 
-Standalone Worker ESM backend for the public Sora GitHub Pages UI. Credentials are runtime secrets, never source files. Both models use only `/step_plan/v1/`; there is no standard-account endpoint or retry/fallback path.
+Standalone Worker ESM backend for the public Sora GitHub Pages UI. Credentials are runtime secrets, never source files. Both models use only `/step_plan/v1/`; there is no standard-account endpoint or billing fallback. The server sends each request once; the browser may retry only explicitly classified temporary chat contention, at most three times with bounded abortable backoff.
 
 Models: `step-5-preview`, `stepaudio-2.5-tts`. Speech uses only the operator's `STEP_VOICE_ID` cloned from Sora's original reference. There is no preset-voice fallback. Routes: POST `/api/chat`, POST `/api/speech`, GET `/api/health`. Speech requires a signed, short-lived, one-use ticket generated from a chat reply. Without a cloned voice, text remains available and speech fails closed before reserving quota.
 

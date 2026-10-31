@@ -5,7 +5,7 @@ const GESTURES=new Set(['none','wave','hand','bow']);
 const hasVoice=env=>typeof env.STEP_VOICE_ID==='string'&&/^voice-[a-zA-Z0-9_-]{3,200}$/.test(env.STEP_VOICE_ID);
 const SYSTEM=`你是“新海天·天色微风”的非官方 AI 角色，语气元气、俏皮、体贴，用自然简短的中文聊天，不冒充真人或原作官方。不要声称看到了摄像头、屏幕或用户的位置。保持日常、非露骨的交流。每次回答 1–3 句，通常 30–100 字，最多 160 字。只返回 JSON：{"reply":"要说的话","emotion":"neutral|happy|shy|confident|worried|playful|serious","gesture":"none|wave|hand|bow"}。动作要克制，普通对话使用 none，问好可以 wave，鼓励可以 hand。不要在 reply 中加入舞台说明、括号指令、Markdown 或 JSON 之外的内容。`;
 const enc=new TextEncoder();
-class PublicError extends Error{constructor(status,code,message){super(message);this.status=status;this.code=code;}}
+class PublicError extends Error{constructor(status,code,message,retryAfter=0){super(message);this.status=status;this.code=code;this.retryAfter=retryAfter;}}
 const clean=(s,max)=>Array.from(s.trim()).slice(0,max).join('');
 const limit=(value,fallback,max)=>Math.max(1,Math.min(max,Number(value)||fallback));
 const b64=bytes=>btoa(String.fromCharCode(...new Uint8Array(bytes))).replaceAll('+','-').replaceAll('/','_').replace(/=+$/,'');
@@ -68,13 +68,20 @@ export function createGateway({fetchUpstream=(...args)=>fetch(...args),clock=Dat
   try{
    response=await fetchUpstream(url,{method:'POST',redirect:'manual',headers:{Authorization:`Bearer ${env.STEPFUN_API_KEY}`,'Content-Type':'application/json'},body:JSON.stringify(payload),signal:cancel.signal});
    // Read within the timeout, including streamed speech. No modern AbortSignal helpers required.
-   if(response.ok){const reader=response.body?.getReader(),chunks=[];let size=0;if(reader)for(;;){const {done,value}=await reader.read();if(done)break;size+=value.length;if(size>4000000){await reader.cancel();throw Error('upstream_body_limit');}chunks.push(value);}const bytes=new Uint8Array(size);let i=0;for(const chunk of chunks){bytes.set(chunk,i);i+=chunk.length;}response=new Response(bytes,{status:response.status,headers:response.headers});}
+   {const reader=response.body?.getReader(),chunks=[];let size=0;const max=response.ok?4000000:4096;if(reader)for(;;){const {done,value}=await reader.read();if(done)break;if(size+value.length>max){if(response.ok){await reader.cancel();throw Error('upstream_body_limit');}chunks.push(value.subarray(0,max-size));size=max;await reader.cancel();break;}size+=value.length;chunks.push(value);}const bytes=new Uint8Array(size);let i=0;for(const chunk of chunks){bytes.set(chunk,i);i+=chunk.length;}response=new Response(bytes,{status:response.status,headers:response.headers});}
   }
   catch{throw new PublicError(502,'upstream_unavailable','连接暂时不太顺畅，请稍后再试。');}
   finally{clearTimeout(timer);request.signal?.removeEventListener('abort',abort);}
   if(!response.ok){
-   await response.body?.cancel();
-   if([402,429].includes(response.status))throw new PublicError(429,'plan_unavailable','套餐额度或速率暂不可用，本次已停止。');
+   let problem;try{problem=await response.json();}catch{}
+   // Inspect a bounded error body for classification; never expose or log its text.
+   const reason=[problem?.error?.type,problem?.error?.code,problem?.error?.message].filter(value=>typeof value==='string').join(' ').toLowerCase();
+   if(response.status===402||response.status===429&&/insufficient[_ ](?:quota|credit|balance)|quota_exceeded|credit.{0,20}(?:exhaust|deplet)|套餐.{0,8}(?:耗尽|用完|过期)/.test(reason))throw new PublicError(402,'plan_quota_unavailable','Token Plan 额度暂不可用，请检查套餐状态。');
+   if(response.status===429){
+    const retryAfter=path==='chat/completions'?Math.max(2,Math.min(120,Number(response.headers.get('retry-after'))||3)):0;
+    if(/concurrency|concurrent|并发/.test(reason))throw new PublicError(429,'model_busy','模型当前并发已满，请稍后再试。',retryAfter);
+    throw new PublicError(429,'model_rate_limited','模型暂时限流，请稍后再试。',retryAfter);
+   }
    throw new PublicError(502,'upstream_rejected','AI 服务暂时不可用，请稍后再试。');
   }
   return response;
@@ -84,7 +91,7 @@ export function createGateway({fetchUpstream=(...args)=>fetch(...args),clock=Dat
   const allowed=new Set(['https://nhckdvrl.github.io',url.origin]);
   if(env.ALLOW_LOCAL==='1'){allowed.add('http://127.0.0.1:5182');allowed.add('http://127.0.0.1:5180');}
   const headers={'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Vary':'Origin'};
-  if(origin&&allowed.has(origin))Object.assign(headers,{'Access-Control-Allow-Origin':origin,'Access-Control-Allow-Methods':'GET, POST, OPTIONS','Access-Control-Allow-Headers':'Content-Type','Access-Control-Max-Age':'600'});
+  if(origin&&allowed.has(origin))Object.assign(headers,{'Access-Control-Allow-Origin':origin,'Access-Control-Allow-Methods':'GET, POST, OPTIONS','Access-Control-Allow-Headers':'Content-Type','Access-Control-Expose-Headers':'Retry-After','Access-Control-Max-Age':'600'});
   const json=(value,status=200)=>Response.json(value,{status,headers});
   if(origin&&!allowed.has(origin))return json({error:'origin_not_allowed',message:'此页面暂不支持连接。'},403);
   if(request.method==='OPTIONS')return new Response(null,{status:204,headers});
@@ -110,7 +117,7 @@ export function createGateway({fetchUpstream=(...args)=>fetch(...args),clock=Dat
    if(!/audio|octet-stream/i.test(type)){await upstream.body?.cancel();throw new PublicError(502,'invalid_audio','语音暂时没有生成成功，文字仍可查看。');}
    return new Response(upstream.body,{headers:{...headers,'Content-Type':'audio/mpeg'}});
   }catch(error){
-   if(error instanceof PublicError)return json({error:error.code,message:error.message},error.status);
+   if(error instanceof PublicError){if(error.retryAfter)headers['Retry-After']=String(error.retryAfter);return json({error:error.code,message:error.message,retryable:error.retryAfter>0,...(error.retryAfter?{retryAfter:error.retryAfter}:{})},error.status);}
    // No upstream errors, credentials, conversation text, or headers in logs.
    return json({error:'service_unavailable',message:'服务正在休息一下，请稍后再来。'},503);
   }

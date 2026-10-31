@@ -1,3 +1,4 @@
+import {requestPlan} from './plan-request';
 export type AIReply={reply:string;emotion:string;gesture:string;ticket:string};
 export interface ConversationController {mouthOpen():number|null;stop():void;}
 const GATEWAY='https://sora-breeze-api-nhckdvrl.nhckdvrl.chatgpt.site';
@@ -21,9 +22,7 @@ export function initConversation(callbacks:{thinking():void;reply(value:AIReply)
   next.onended=()=>{if(source!==next)return;source=null;mouth=0;status('听着呢');next.disconnect();};next.start();status('正在说话…');
  }
  async function post(path:string,body:unknown,signal:AbortSignal){
-  const response=await fetch(GATEWAY+'/api/'+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal});
-  if(!response.ok){const error=await response.json().catch(()=>null);throw Error(typeof error?.message==='string'?error.message:'连接暂时不顺畅，请稍后再试。');}
-  return response;
+  return requestPlan(GATEWAY+'/api/'+path,body,{signal,onAttempt(){if(path==='chat')status('正在想一想…');},onRetry({seconds,attempt,limit}){status(`模型忙 · ${seconds} 秒后重试（${attempt}/${limit}）`);}});
  }
  form.addEventListener('submit',async event=>{
   event.preventDefault();if(busy)return;const text=input.value.trim();if(!text)return;
@@ -45,7 +44,7 @@ export function initConversation(callbacks:{thinking():void;reply(value:AIReply)
     }catch(error){if(current!==epoch)return;busy=false;status(error instanceof Error?error.message:'语音暂不可用，文字仍可查看。');}
    }else{busy=false;status('听着呢');}
   }catch(error){
-   if(current!==epoch)return;busy=false;const text=error instanceof Error?error.message:'连接暂时不顺畅，请稍后再试。';status(text);callbacks.error(text);
+   if(current!==epoch)return;busy=false;if(!input.value.trim())input.value=text;const detail=error instanceof Error?error.message:'连接暂时不顺畅，请稍后再试。';status(detail);callbacks.error(detail);
   }finally{if(current===epoch){busy=false;controller=null;send.disabled=false;stopButton.disabled=!source;replay.disabled=!cached;}}
  });
  stopButton.addEventListener('click',stop);

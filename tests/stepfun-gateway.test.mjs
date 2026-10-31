@@ -27,7 +27,7 @@ test('quota exhaustion never retries or falls back to account balance',async t=>
  const env=setup();t.after(()=>env.DB.close());let calls=0;
  const api=createGateway({fetchUpstream:async url=>{assert.match(url,/\/step_plan\/v1\//);calls++;return new Response('private upstream error',{status:402});}});
  const response=await api(req('chat',{message:'你好'}),env),body=await response.json();
- assert.equal(response.status,429);assert.equal(body.error,'plan_unavailable');assert.equal(calls,1);assert.ok(!JSON.stringify(body).includes('mock-key'));assert.ok(!JSON.stringify(body).includes('private upstream'));
+ assert.equal(response.status,402);assert.equal(body.error,'plan_quota_unavailable');assert.equal(body.retryable,false);assert.equal(calls,1);assert.ok(!JSON.stringify(body).includes('mock-key'));assert.ok(!JSON.stringify(body).includes('private upstream'));
 });
 test('shared atomic daily limit holds across gateway instances and concurrent visitors',async t=>{
  const env=setup();env.MAX_DAILY_CALLS=3;t.after(()=>env.DB.close());let calls=0;
@@ -58,4 +58,19 @@ test('missing cloned voice disables speech without using a preset or consuming s
  const health=await api(new Request('https://sora.test/api/health'),env);assert.equal((await health.json()).voiceReady,false);
  const reply=await(await api(req('chat',{message:'hi'}),env)).json();
  const response=await api(req('speech',{ticket:reply.ticket}),env);assert.equal(response.status,503);assert.equal((await response.json()).error,'voice_not_ready');assert.equal(calls,1);
+});
+
+test('provider concurrency and rate limits are separate from exhausted plan credit',async t=>{
+ const cases=[
+  [{type:'rate_limited',message:'concurrency reached, current: 9, limit: 8'},429,'model_busy',true],
+  [{type:'rate_limited',message:'requests per minute exceeded'},429,'model_rate_limited',true],
+  [{type:'insufficient_quota',message:'No credits'},402,'plan_quota_unavailable',false]
+ ];
+ for(const [error,status,code,retryable] of cases){
+  const env=setup();t.after(()=>env.DB.close());let calls=0;
+  const api=createGateway({fetchUpstream:async()=>{calls++;return Response.json({error},{status:429,headers:{'Retry-After':'4'}});}});
+  const response=await api(req('chat',{message:'hi'}),env),body=await response.json();assert.equal(response.status,status);assert.equal(body.error,code);assert.equal(body.retryable,retryable);assert.equal(calls,1);
+  if(retryable){assert.equal(response.headers.get('retry-after'),'4');assert.equal(body.retryAfter,4);}
+  assert.ok(!JSON.stringify(body).includes('current: 9'));
+ }
 });
