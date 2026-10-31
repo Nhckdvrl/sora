@@ -10,7 +10,7 @@ const $=<T extends HTMLElement>(s:string)=>document.querySelector<T>(s)!;
 const canvas=$<HTMLCanvasElement>('#sora-canvas'),stage=$('#stage'),scene=$('.stage-column');
 const names=['自然','开心','害羞','得意','担心','坏笑','含泪','俏皮','撒娇','认真','单眼眨眼','轻闭双眼'];
 const status=$('#status'),exportStatus=$('#export-status'),feedback=$('#touch-feedback'),hint=$('#interaction-hint');
-let expression=0,paused=false,portrait=false,background=0,ready=false,runtime:RigRuntime,modelSource='';
+let expression=0,paused=false,portrait=true,background=0,ready=false,runtime:RigRuntime,modelSource='';
 let pointer={x:0,y:0},look={x:0,y:0},eyeTarget={x:0,y:0},gaze={x:0,y:0};
 let last=performance.now(),lastRender=0,elapsed=0,nextBlink=2.8,blinkStart=-1;
 let winkUntil=0,greetUntil=0,hairImpulse=0,breezeUntil=0;
@@ -22,7 +22,11 @@ const history=new Map<ReactionKind,{at:number;count:number}>();
 const enabled=(id:string)=>$<HTMLInputElement>('#'+id).checked;
 const value=(id:string)=>Number($<HTMLInputElement>('#'+id).value);
 const clamp=(v:number,e=1)=>Math.max(-e,Math.min(e,v));
-const camera=():RenderOptions=>({transparent:true,webglWarp:true,fitPadding:25,zoom:portrait?1.85:1.08,panY:portrait?canvas.clientHeight*.36:0});
+const camera=():RenderOptions=>{
+ const w=canvas.clientWidth,h=canvas.clientHeight,fit=Math.max(.001,Math.min((w-50)/1300,(h-50)/1800));
+ const scale=portrait?Math.max(.05,Math.min((w-40)/600,(h-40)/760)):fit*1.08;
+ return {transparent:true,webglWarp:true,fitPadding:25,zoom:scale/fit,panY:portrait?810*scale-.44*h:0};
+};
 const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
 if(reduced){$<HTMLInputElement>('#idle').checked=false;$<HTMLInputElement>('#follow').checked=false;document.body.classList.add('reduced');}
 const buttons=names.map((name,i)=>{const b=document.createElement('button');b.textContent=name;b.setAttribute('aria-pressed',String(i===0));b.onclick=()=>selectExpression(i);$('#expressions').append(b);return b;});
@@ -44,8 +48,8 @@ function touch(kind:ReactionKind,p:{x:number;y:number}){
  stage.classList.remove('touch-pulse');void stage.offsetWidth;stage.classList.add('touch-pulse');
 }
 function stagePoint(clientX:number,clientY:number){
- const r=canvas.getBoundingClientRect(),scale=Math.min((r.width-50)/1300,(r.height-50)/1800)*(portrait?1.85:1.08);
- return {x:(clientX-r.left-(r.width-1300*scale)/2)/scale,y:(clientY-r.top-(r.height-1800*scale)/2-(portrait?r.height*.36:0))/scale};
+ const r=canvas.getBoundingClientRect(),view=camera(),scale=Math.min((r.width-50)/1300,(r.height-50)/1800)*(view.zoom??1);
+ return {x:(clientX-r.left-(r.width-1300*scale)/2)/scale,y:(clientY-r.top-(r.height-1800*scale)/2-(view.panY??0))/scale};
 }
 // Barycentric UV recovery keeps small targets aligned with the actual mesh.
 function materialHit(clientX:number,clientY:number):{point:{x:number;y:number};id:string}|null{
